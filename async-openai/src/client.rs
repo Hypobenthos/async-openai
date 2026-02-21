@@ -5,8 +5,6 @@ use bytes::Bytes;
 #[cfg(not(target_family = "wasm"))]
 use futures::{stream::StreamExt, Stream};
 use reqwest::{header::HeaderMap, multipart::Form, Response};
-#[cfg(not(target_family = "wasm"))]
-use reqwest_eventsource::{Error as EventSourceError, Event, EventSource, RequestBuilderExt};
 use serde::{de::DeserializeOwned, Serialize};
 
 #[cfg(not(target_family = "wasm"))]
@@ -649,9 +647,22 @@ impl<C: Config> Client<C> {
             .build_request_builder(reqwest::Method::POST, path, request_options)
             .json(&request);
 
-        let event_source = request_builder.eventsource().unwrap();
+        let response = match request_builder.send().await.map_err(OpenAIError::Reqwest) {
+            Ok(r) => r,
+            Err(e) => return Box::pin(futures::stream::once(futures::future::ready(Err(e)))),
+        };
 
-        stream(event_source).await
+        if !response.status().is_success() {
+            let err = read_response(response).await.unwrap_err();
+            return Box::pin(futures::stream::once(futures::future::ready(Err(err))));
+        }
+
+        let byte_stream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other)),
+        );
+        stream(byte_stream).await
     }
 
     #[allow(unused)]
@@ -671,9 +682,22 @@ impl<C: Config> Client<C> {
             .build_request_builder(reqwest::Method::POST, path, request_options)
             .json(&request);
 
-        let event_source = request_builder.eventsource().unwrap();
+        let response = match request_builder.send().await.map_err(OpenAIError::Reqwest) {
+            Ok(r) => r,
+            Err(e) => return Box::pin(futures::stream::once(futures::future::ready(Err(e)))),
+        };
 
-        stream_mapped_raw_events(event_source, event_mapper).await
+        if !response.status().is_success() {
+            let err = read_response(response).await.unwrap_err();
+            return Box::pin(futures::stream::once(futures::future::ready(Err(err))));
+        }
+
+        let byte_stream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other)),
+        );
+        stream_mapped_raw_events(byte_stream, event_mapper).await
     }
 
     /// Make HTTP GET request to receive SSE
@@ -690,9 +714,22 @@ impl<C: Config> Client<C> {
         let request_builder =
             self.build_request_builder(reqwest::Method::GET, path, request_options);
 
-        let event_source = request_builder.eventsource().unwrap();
+        let response = match request_builder.send().await.map_err(OpenAIError::Reqwest) {
+            Ok(r) => r,
+            Err(e) => return Box::pin(futures::stream::once(futures::future::ready(Err(e)))),
+        };
 
-        stream(event_source).await
+        if !response.status().is_success() {
+            let err = read_response(response).await.unwrap_err();
+            return Box::pin(futures::stream::once(futures::future::ready(Err(err))));
+        }
+
+        let byte_stream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other)),
+        );
+        stream(byte_stream).await
     }
 }
 
@@ -724,73 +761,53 @@ async fn read_response(response: Response) -> Result<(Bytes, HeaderMap), OpenAIE
     Ok((bytes, headers))
 }
 
-#[cfg(not(target_family = "wasm"))]
-async fn map_stream_error(value: EventSourceError) -> OpenAIError {
-    match value {
-        EventSourceError::InvalidStatusCode(status_code, response) => {
-            read_response(response).await.expect_err(&format!(
-                "Unreachable because read_response returns err when status_code {status_code} is invalid"
-            ))
-        }
-        _ => OpenAIError::StreamError(Box::new(StreamError::ReqwestEventSource(value))),
-    }
-}
-
 /// Request which responds with SSE.
 /// [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format)
 #[cfg(not(target_family = "wasm"))]
 pub(crate) async fn stream<O>(
-    mut event_source: EventSource,
+    byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>,
 ) -> Pin<Box<dyn Stream<Item = Result<O, OpenAIError>> + Send>>
 where
     O: DeserializeOwned + std::marker::Send + 'static,
 {
+    let event_stream = eventsource_stream::EventStream::new(byte_stream);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        while let Some(ev) = event_source.next().await {
-            match ev {
+        use futures::StreamExt;
+        let mut event_stream = std::pin::pin!(event_stream);
+
+        while let Some(event_result) = event_stream.next().await {
+            match event_result {
                 Err(e) => {
-                    // Handle StreamEnded gracefully - it's a normal end of stream, not an error
-                    // https://github.com/64bit/async-openai/issues/456
-                    match &e {
-                        EventSourceError::StreamEnded => {
-                            break;
-                        }
-                        _ => {
-                            if let Err(_e) = tx.send(Err(map_stream_error(e).await)) {
-                                // rx dropped
-                                break;
-                            }
-                        }
+                    if let Err(_e) = tx.send(Err(OpenAIError::StreamError(Box::new(
+                        StreamError::EventStream(e.to_string()),
+                    )))) {
+                        // rx dropped
+                        break;
                     }
                 }
-                Ok(event) => match event {
-                    Event::Message(message) => {
-                        if message.data == "[DONE]" {
-                            break;
-                        }
-
-                        if message.event == "keepalive" {
-                            continue;
-                        }
-
-                        let response = match serde_json::from_str::<O>(&message.data) {
-                            Err(e) => Err(map_deserialization_error(e, message.data.as_bytes())),
-                            Ok(output) => Ok(output),
-                        };
-
-                        if let Err(_e) = tx.send(response) {
-                            // rx dropped
-                            break;
-                        }
+                Ok(event) => {
+                    if event.data == "[DONE]" {
+                        break;
                     }
-                    Event::Open => continue,
-                },
+
+                    if event.event == "keepalive" {
+                        continue;
+                    }
+
+                    let response = match serde_json::from_str::<O>(&event.data) {
+                        Err(e) => Err(map_deserialization_error(e, event.data.as_bytes())),
+                        Ok(output) => Ok(output),
+                    };
+
+                    if let Err(_e) = tx.send(response) {
+                        // rx dropped
+                        break;
+                    }
+                }
             }
         }
-
-        event_source.close();
     });
 
     Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
@@ -798,61 +815,53 @@ where
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) async fn stream_mapped_raw_events<O>(
-    mut event_source: EventSource,
+    byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>,
     event_mapper: impl Fn(eventsource_stream::Event) -> Result<O, OpenAIError> + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = Result<O, OpenAIError>> + Send>>
 where
     O: DeserializeOwned + std::marker::Send + 'static,
 {
+    let event_stream = eventsource_stream::EventStream::new(byte_stream);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        while let Some(ev) = event_source.next().await {
-            match ev {
+        use futures::StreamExt;
+        let mut event_stream = std::pin::pin!(event_stream);
+
+        while let Some(event_result) = event_stream.next().await {
+            match event_result {
                 Err(e) => {
-                    // Handle StreamEnded gracefully - it's a normal end of stream, not an error
-                    // https://github.com/64bit/async-openai/issues/456
-                    match &e {
-                        EventSourceError::StreamEnded => {
-                            break;
-                        }
-                        _ => {
-                            if let Err(_e) = tx.send(Err(map_stream_error(e).await)) {
-                                // rx dropped
-                                break;
-                            }
-                        }
+                    if let Err(_e) = tx.send(Err(OpenAIError::StreamError(Box::new(
+                        StreamError::EventStream(e.to_string()),
+                    )))) {
+                        // rx dropped
+                        break;
                     }
                 }
-                Ok(event) => match event {
-                    Event::Message(message) => {
-                        let mut done = false;
+                Ok(event) => {
+                    let mut done = false;
 
-                        if message.data == "[DONE]" {
-                            done = true;
-                        }
-
-                        if message.event == "keepalive" {
-                            continue;
-                        }
-
-                        let response = event_mapper(message);
-
-                        if let Err(_e) = tx.send(response) {
-                            // rx dropped
-                            break;
-                        }
-
-                        if done {
-                            break;
-                        }
+                    if event.data == "[DONE]" {
+                        done = true;
                     }
-                    Event::Open => continue,
-                },
+
+                    if event.event == "keepalive" {
+                        continue;
+                    }
+
+                    let response = event_mapper(event);
+
+                    if let Err(_e) = tx.send(response) {
+                        // rx dropped
+                        break;
+                    }
+
+                    if done {
+                        break;
+                    }
+                }
             }
         }
-
-        event_source.close();
     });
 
     Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))

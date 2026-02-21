@@ -141,7 +141,6 @@ _api = [
     "dep:futures",
     "dep:rand",
     "dep:reqwest",
-    "dep:reqwest-eventsource",
     "dep:thiserror",
     "dep:tokio",
     "dep:tokio-stream",
@@ -168,6 +167,7 @@ base64 = { version = "0.22", optional = true }
 rand = { version = "0.9", optional = true }
 reqwest = { version = "0.13", features = [
   "json",
+  "query",
   "stream",
   "multipart",
 ], default-features = false, optional = true }
@@ -188,7 +188,6 @@ futures = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["fs", "macros"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tokio-util = { version = "0.7", features = ["codec", "io-util"], optional = true }
-reqwest-eventsource = { version = "0.6.0", optional = true }
 eventsource-stream = { version = "0.2", optional = true }
 ## For Realtime websocket
 tokio-tungstenite = { version = "0.28", optional = true, default-features = false }
