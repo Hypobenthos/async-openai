@@ -14,10 +14,10 @@ repository = "https://github.com/64bit/async-openai"
 
 [features]
 default = ["rustls"]
-# Enable rustls for TLS support
-rustls = ["dep:reqwest", "reqwest/rustls-tls-native-roots"]
-# Enable rustls and webpki-roots
-rustls-webpki-roots = ["dep:reqwest", "reqwest/rustls-tls-webpki-roots"]
+# Enable rustls for TLS support (uses platform native certificate verifier)
+rustls = ["dep:reqwest", "reqwest/rustls"]
+# Enable rustls (webpki-roots no longer a separate feature in reqwest 0.13; maps to rustls)
+rustls-webpki-roots = ["dep:reqwest", "reqwest/rustls"]
 # Enable native-tls for TLS support
 native-tls = ["dep:reqwest", "reqwest/native-tls"]
 # Remove dependency on OpenSSL
@@ -166,7 +166,7 @@ bytes = { version = "1.11", optional = true }
 async-openai-macros = { path = "../async-openai-macros", version = "0.1.1", optional = true }
 base64 = { version = "0.22", optional = true }
 rand = { version = "0.9", optional = true }
-reqwest = { version = "0.12", features = [
+reqwest = { version = "0.13", features = [
   "json",
   "stream",
   "multipart",
